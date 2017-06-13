@@ -16,6 +16,7 @@ import errno
 import socket
 
 from botocore.vendored import six
+from botocore.vendored.six.moves import urllib
 
 if six.PY3:
     # In python3, socket.error is OSError, which is too general

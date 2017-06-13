@@ -91,3 +91,171 @@ class LazyLoadedWaiterModel(object):
     def get_waiter(self, waiter_name):
         return self._session.get_waiter_model(
             self._service_name, self._api_version).get_waiter(waiter_name)
+
+import random
+import json
+import urllib
+import six
+import time
+import logging
+from botocore.config import Config
+from boto3.compat import urllib
+
+logger = logging.getLogger("boto3.utils")
+
+
+def retry_url(url, retry_on_404=True, num_retries=10, timeout=None):
+    """
+    Retry a url.  This is specifically used for accessing the metadata
+    service on an instance.  Since this address should never be proxied
+    (for security reasons), we create a ProxyHandler with a NULL
+    dictionary to override any proxy settings in the environment.
+    """
+    config = Config()
+    for i in range(0, num_retries):
+        try:
+            proxy_handler = urllib.request.ProxyHandler({})
+            opener = urllib.request.build_opener(proxy_handler)
+            req = urllib.request.Request(url)
+            r = opener.open(req, timeout=timeout)
+            result = r.read()
+
+            if(not isinstance(result, six.string_types) and
+                   hasattr(result, 'decode')):
+                result = result.decode('utf-8')
+
+            return result
+        except urllib.error.HTTPError as e:
+            code = e.getcode()
+            if code == 404 and not retry_on_404:
+                return ''
+        except Exception as e:
+            logger.exception('Caught exception reading instance data')
+        # If not on the last iteration of the loop then sleep.
+        if i + 1 != num_retries:
+            logger.debug('Sleeping before retrying')
+            time.sleep(min(2 ** i, config.get('Boto', 'max_retry_delay', 60)))
+    logger.error('Unable to read instance data, giving up')
+    return ''
+
+
+class LazyLoadMetadata(dict):
+    def __init__(self, url, num_retries, timeout=None):
+        self._url = url
+        self._num_retries = num_retries
+        self._leaves = {}
+        self._dicts = []
+        self._timeout = timeout
+        data = retry_url(self._url, num_retries=self._num_retries, timeout=self._timeout)
+        if data:
+            fields = data.split('\n')
+            for field in fields:
+                if field.endswith('/'):
+                    key = field[0:-1]
+                    self._dicts.append(key)
+                else:
+                    p = field.find('=')
+                    if p > 0:
+                        key = field[p + 1:]
+                        resource = field[0:p] + '/openssh-key'
+                    else:
+                        key = resource = field
+                    self._leaves[key] = resource
+                self[key] = None
+
+    def _materialize(self):
+        for key in self:
+            self[key]
+
+    def __getitem__(self, key):
+        if key not in self:
+            # allow dict to throw the KeyError
+            return super(LazyLoadMetadata, self).__getitem__(key)
+
+        # already loaded
+        val = super(LazyLoadMetadata, self).__getitem__(key)
+        if val is not None:
+            return val
+
+        if key in self._leaves:
+            resource = self._leaves[key]
+            last_exception = None
+
+            for i in range(0, self._num_retries):
+                try:
+                    val = retry_url(
+                        self._url + urllib.parse.quote(resource,
+                                                       safe="/:"),
+                        num_retries=self._num_retries,
+                        timeout=self._timeout)
+                    if val and val[0] == '{':
+                        val = json.loads(val)
+                        break
+                    else:
+                        p = val.find('\n')
+                        if p > 0:
+                            val = val.split('\n')
+                        break
+
+                except ValueError as e:
+                    logger.debug(
+                        "encountered '%s' exception: %s" % (
+                            e.__class__.__name__, e))
+                    logger.debug(
+                        'corrupted JSON data found: %s' % val)
+                    last_exception = e
+
+                except Exception as e:
+                    logger.debug("encountered unretryable" +
+                                   " '%s' exception, re-raising" % (
+                                       e.__class__.__name__))
+                    last_exception = e
+                    raise
+
+                logger.error("Caught exception reading meta data" +
+                               " for the '%s' try" % (i + 1))
+
+                if i + 1 != self._num_retries:
+                    next_sleep = min(
+                        random.random() * 2 ** i,
+                        boto.config.get('Boto', 'max_retry_delay', 60))
+                    time.sleep(next_sleep)
+            else:
+                logger.error('Unable to read meta data, giving up')
+                logger.error(
+                    "encountered '%s' exception: %s" % (
+                        last_exception.__class__.__name__, last_exception))
+                raise last_exception
+
+            self[key] = val
+        elif key in self._dicts:
+            self[key] = LazyLoadMetadata(self._url + key + '/',
+                                         self._num_retries)
+
+        return super(LazyLoadMetadata, self).__getitem__(key)
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def values(self):
+        self._materialize()
+        return super(LazyLoadMetadata, self).values()
+
+    def items(self):
+        self._materialize()
+        return super(LazyLoadMetadata, self).items()
+
+    def __str__(self):
+        self._materialize()
+        return super(LazyLoadMetadata, self).__str__()
+
+    def __repr__(self):
+        self._materialize()
+        return super(LazyLoadMetadata, self).__repr__()
+
+
+def _get_instance_metadata(url, num_retries, timeout=None):
+    return LazyLoadMetadata(url, num_retries, timeout)
